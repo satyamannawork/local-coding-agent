@@ -1,0 +1,179 @@
+{
+  "name": "local-coding-agent",
+  "displayName": "Local Coding Agent",
+  "description": "Local AI coding agent powered by Ollama and Qwen3-Coder",
+  "version": "0.2.0",
+  "publisher": "local-coding-agent-dev",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "local-coding-agent.openAgent",
+        "title": "Local Coding Agent: Open"
+      },
+      {
+        "command": "local-coding-agent.listWorkspaceFiles",
+        "title": "Local Coding Agent: List Workspace Files"
+      },
+      {
+        "command": "local-coding-agent.readFile",
+        "title": "Local Coding Agent: Read File"
+      },
+      {
+        "command": "local-coding-agent.optimizeAndTest",
+        "title": "Local Coding Agent: Optimize File & Generate Tests"
+      },
+      {
+        "command": "local-coding-agent.raisePR",
+        "title": "Local Coding Agent: Raise Pull Request"
+      },
+      {
+        "command": "local-coding-agent.selectModel",
+        "title": "Local Coding Agent: Select Model"
+      },
+      {
+        "command": "local-coding-agent.switchMode",
+        "title": "Local Coding Agent: Switch Mode (Ask / Agent)"
+      },
+      {
+        "command": "localCodingAgent.approveAllChanges",
+        "title": "Local Coding Agent: Approve All Pending Changes"
+      },
+      {
+        "command": "localCodingAgent.undoAllChanges",
+        "title": "Local Coding Agent: Undo All Pending Changes"
+      },
+      {
+        "command": "localCodingAgent.approveChange",
+        "title": "Local Coding Agent: Approve Change"
+      },
+      {
+        "command": "localCodingAgent.undoChange",
+        "title": "Local Coding Agent: Undo Change"
+      },
+      {
+        "command": "localCodingAgent.showChangeDiff",
+        "title": "Local Coding Agent: Show Change Diff"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "localCodingAgentSidebar",
+          "title": "Local Coding Agent",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "localCodingAgentSidebar": [
+        {
+          "type": "webview",
+          "id": "localCodingAgent.chatView",
+          "name": "Chat",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Local Coding Agent",
+      "properties": {
+        "localCodingAgent.ollamaUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434",
+          "description": "Ollama server URL used by the Local Coding Agent."
+        },
+        "localCodingAgent.model": {
+          "type": "string",
+          "default": "qwen3:14b",
+          "description": "Default Ollama model used by the Local Coding Agent. Overridden per-session by the model picker in the chat view."
+        },
+        "localCodingAgent.keepAlive": {
+          "type": "string",
+          "default": "30m",
+          "description": "How long Ollama keeps the model loaded in memory between requests (Ollama's keep_alive param, e.g. '30m', '1h', '-1' to keep forever). Higher values give faster responses after the first message by avoiding model reloads."
+        },
+        "localCodingAgent.includeActiveFileByDefault": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether the currently open file is attached as context to new chat messages by default. Can be toggled per-message in the chat view."
+        },
+        "localCodingAgent.contextLength": {
+          "type": "number",
+          "default": 16384,
+          "minimum": 2048,
+          "description": "Context window (Ollama num_ctx) used for chat requests. Agent mode needs room for tool definitions and file contents; lower it if your machine runs out of memory."
+        },
+        "localCodingAgent.maxAgentSteps": {
+          "type": "number",
+          "default": 25,
+          "minimum": 2,
+          "description": "Maximum number of model/tool round trips the agent may take for one message in Agent mode."
+        },
+        "localCodingAgent.commandTimeoutSeconds": {
+          "type": "number",
+          "default": 120,
+          "minimum": 5,
+          "description": "Commands the agent runs (after your approval) are stopped after this many seconds."
+        }
+      }
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "localCodingAgent.approveChange",
+          "when": "false"
+        },
+        {
+          "command": "localCodingAgent.undoChange",
+          "when": "false"
+        },
+        {
+          "command": "localCodingAgent.showChangeDiff",
+          "when": "false"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "npm run check-types && npm run lint && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "npm run check-types && npm run lint && node esbuild.js --production",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vscode-test",
+    "vsix": "npm run package && vsce package --out local-coding-agent.vsix"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "24.x",
+    "typescript-eslint": "^8.61.1",
+    "eslint": "^10.5.0",
+    "esbuild": "^0.28.1",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^6.0.3",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0",
+    "@vscode/vsce": "^3.6.2"
+  },
+  "overrides": {
+    "diff": "^8.0.4",
+    "serialize-javascript": "^7.0.6"
+  }
+}
