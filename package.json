@@ -109,9 +109,14 @@
         },
         "localCodingAgent.contextLength": {
           "type": "number",
-          "default": 16384,
+          "default": 32768,
           "minimum": 2048,
-          "description": "Context window (Ollama num_ctx) used for chat requests. Agent mode needs room for tool definitions and file contents; lower it if your machine runs out of memory."
+          "description": "Context window (Ollama num_ctx) used for chat requests. Agent mode needs room for tool definitions and file contents. A bigger window uses more memory; lower it if your machine runs out of memory. Older tool output is trimmed automatically when the conversation gets close to this limit."
+        },
+        "localCodingAgent.thinking": {
+          "type": "boolean",
+          "default": false,
+          "description": "Let reasoning models such as qwen3 think before answering. Answers can be better but arrive much later. The reasoning is shown live in a collapsible panel. Can also be toggled from the chat view."
         },
         "localCodingAgent.maxAgentSteps": {
           "type": "number",

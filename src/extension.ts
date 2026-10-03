@@ -21,6 +21,24 @@ interface ChatMessage {
     tool_name?: string;
 }
 
+interface ChatStats {
+    promptTokens: number;
+    outputTokens: number;
+    tokensPerSecond: number;
+    totalSeconds: number;
+}
+
+/** Sampling options that stop qwen3 & co. from looping on the same tokens. */
+const ANTI_REPEAT_OPTIONS = { presence_penalty: 1.5, repeat_penalty: 1.1, repeat_last_n: 256 };
+/** Stronger settings used for one automatic retry after a repetition abort. */
+const RECOVERY_OPTIONS = { presence_penalty: 1.8, repeat_penalty: 1.25, repeat_last_n: 512, temperature: 0.8 };
+/** Hard cap on generated tokens per step so a runaway answer can't spin forever. */
+const MAX_OUTPUT_TOKENS = 8192;
+/** Rough characters-per-token ratio used to estimate prompt size. */
+const CHARS_PER_TOKEN = 3.5;
+/** Tool results longer than this are shortened once the context gets full. */
+const COMPACT_KEEP_CHARS = 600;
+
 interface OllamaToolCall {
     function: {
         name: string;
@@ -39,7 +57,8 @@ function settings() {
     return {
         ollamaUrl: config.get<string>('ollamaUrl', DEFAULT_OLLAMA_URL).replace(/\/$/, ''),
         keepAlive: config.get<string>('keepAlive', DEFAULT_KEEP_ALIVE),
-        contextLength: config.get<number>('contextLength', 16384),
+        contextLength: config.get<number>('contextLength', 32768),
+        thinking: config.get<boolean>('thinking', false),
         maxAgentSteps: config.get<number>('maxAgentSteps', 25),
         commandTimeoutSeconds: config.get<number>('commandTimeoutSeconds', 120)
     };
@@ -62,6 +81,10 @@ class LocalCodingAgentViewProvider implements vscode.WebviewViewProvider {
     private abortController?: AbortController;
     private busy = false;
     private history: ChatMessage[] = [];
+    /** Last file attached to the conversation, so an unchanged file isn't resent every turn. */
+    private lastAttached?: { relativePath: string; content: string };
+    /** Models that rejected the "think" flag; we stop sending it to them. */
+    private readonly noThinkSupport = new Set<string>();
 
     private readonly commandApprovals = new Map<string, { command: string; resolve: (command: string | undefined) => void }>();
     private approvalCounter = 0;
@@ -78,7 +101,12 @@ class LocalCodingAgentViewProvider implements vscode.WebviewViewProvider {
         this.mode = this.context.workspaceState.get<AgentMode>(MODE_STATE_KEY) ?? 'ask';
 
         this.context.subscriptions.push(
-            this.edits.onDidChangeStatus(change => this.postChange(change))
+            this.edits.onDidChangeStatus(change => this.postChange(change)),
+            vscode.workspace.onDidChangeConfiguration(event => {
+                if (event.affectsConfiguration('localCodingAgent.thinking')) {
+                    this.post({ type: 'thinkingChanged', enabled: settings().thinking });
+                }
+            })
         );
     }
 
@@ -156,6 +184,7 @@ class LocalCodingAgentViewProvider implements vscode.WebviewViewProvider {
             case 'refreshModels':
                 await this.postModelList();
                 this.post({ type: 'modeChanged', mode: this.mode });
+                this.post({ type: 'thinkingChanged', enabled: settings().thinking });
                 this.post({ type: 'pendingCount', count: this.edits.pending().length });
                 break;
 
@@ -174,6 +203,12 @@ class LocalCodingAgentViewProvider implements vscode.WebviewViewProvider {
             case 'newChat':
                 this.abortController?.abort();
                 this.history = [];
+                this.lastAttached = undefined;
+                break;
+
+            case 'setThinking':
+                await vscode.workspace.getConfiguration('localCodingAgent')
+                    .update('thinking', !!message.enabled, vscode.ConfigurationTarget.Global);
                 break;
 
             case 'stopGeneration':
@@ -257,19 +292,68 @@ class LocalCodingAgentViewProvider implements vscode.WebviewViewProvider {
             this.post({ type: 'contextAttached', relativePath: fileContext.relativePath, truncated: fileContext.truncated });
         }
 
-        this.history.push({ role: 'user', content: text });
+        this.history.push({ role: 'user', content: text + this.attachmentFor(fileContext) });
         this.abortController = new AbortController();
         this.busy = true;
 
         try {
-            await this.runAgentLoop(this.abortController.signal, fileContext);
+            await this.runAgentLoop(this.abortController.signal);
         } finally {
             this.busy = false;
             this.cancelPendingApprovals();
         }
     }
 
-    private async runAgentLoop(signal: AbortSignal, fileContext?: ActiveFileContext): Promise<void> {
+    /**
+     * The open file goes into the user message (not the system prompt) so the
+     * system prompt never changes and Ollama can reuse its cached prompt
+     * prefix between turns. An unchanged file is not sent again.
+     */
+    private attachmentFor(fileContext?: ActiveFileContext): string {
+        if (!fileContext) {
+            return '';
+        }
+        const last = this.lastAttached;
+        if (last && last.relativePath === fileContext.relativePath && last.content === fileContext.content) {
+            return `\n\n(Open file: ${fileContext.relativePath}, unchanged since it was shared above.)`;
+        }
+        this.lastAttached = { relativePath: fileContext.relativePath, content: fileContext.content };
+        return `\n\nThe developer currently has this file open in the editor:\n\nFile: ${fileContext.relativePath}\n\`\`\`\n${fileContext.content}\n\`\`\`\n`;
+    }
+
+    /**
+     * Keeps the conversation inside the context window. When the estimated
+     * prompt gets close to num_ctx, the oldest long tool results and file
+     * attachments are shortened (oldest first) instead of letting Ollama cut
+     * off the start of the prompt, which drops the system instructions and
+     * makes the model ramble or loop.
+     */
+    private compactHistory(numCtx: number, fixedChars: number): void {
+        const budgetChars = numCtx * 0.7 * CHARS_PER_TOKEN;
+        let total = fixedChars + this.history.reduce((sum, m) => sum + m.content.length, 0);
+        // Never touch the latest user message: it holds the current request.
+        let lastUser = -1;
+        this.history.forEach((m, i) => { if (m.role === 'user') { lastUser = i; } });
+
+        for (let i = 0; i < this.history.length && total > budgetChars; i++) {
+            const m = this.history[i];
+            if (i === lastUser || m.content.length <= COMPACT_KEEP_CHARS + 200) {
+                continue;
+            }
+            if (m.role !== 'tool' && m.role !== 'user') {
+                continue;
+            }
+            const shortened = m.content.slice(0, COMPACT_KEEP_CHARS) +
+                '\n[...older content trimmed to save context; read it again with a tool if needed...]';
+            total -= m.content.length - shortened.length;
+            m.content = shortened;
+            if (m.role === 'user') {
+                this.lastAttached = undefined;
+            }
+        }
+    }
+
+    private async runAgentLoop(signal: AbortSignal): Promise<void> {
 
         const cfg = settings();
         const mode = this.mode;
@@ -284,10 +368,6 @@ class LocalCodingAgentViewProvider implements vscode.WebviewViewProvider {
             onChange: (_change: PendingChange) => { /* cards are posted via onDidChangeStatus */ }
         };
 
-        const contextBlock = fileContext
-            ? `\n\nThe developer currently has this file open in the editor:\n\nFile: ${fileContext.relativePath}\n\`\`\`\n${fileContext.content}\n\`\`\`\n`
-            : '';
-
         try {
 
             for (let step = 0; step < maxSteps; step++) {
@@ -296,17 +376,35 @@ class LocalCodingAgentViewProvider implements vscode.WebviewViewProvider {
 
                 const systemMessage: ChatMessage = {
                     role: 'system',
-                    content: (mode === 'agent' ? AGENT_PROMPT : ASK_PROMPT) + contextBlock
+                    content: mode === 'agent' ? AGENT_PROMPT : ASK_PROMPT
                 };
 
                 const allowTools = step < maxSteps - 1;
+                const tools = allowTools ? buildToolDefinitions(mode) : undefined;
 
-                const { content, toolCalls } = await this.streamChat({
+                this.compactHistory(cfg.contextLength, systemMessage.content.length + JSON.stringify(tools ?? []).length);
+
+                const request = {
                     model,
                     signal,
                     messages: [systemMessage, ...this.history],
-                    tools: allowTools ? buildToolDefinitions(mode) : undefined
-                });
+                    tools
+                };
+
+                let reply: { content: string; toolCalls: OllamaToolCall[] };
+                try {
+                    reply = await this.streamChat(request);
+                } catch (error) {
+                    // qwen3 sometimes gets stuck repeating itself and Ollama aborts
+                    // the prediction. Retry once without thinking and with
+                    // stronger anti-repeat sampling before giving up.
+                    if (signal.aborted || !isRepetitionError(error)) {
+                        throw error;
+                    }
+                    this.post({ type: 'notice', ok: false, text: 'The model got stuck repeating itself. Retrying with stricter settings…' });
+                    reply = await this.streamChat({ ...request, recovery: true });
+                }
+                const { content, toolCalls } = reply;
 
                 if (toolCalls.length === 0 || !allowTools) {
                     this.history.push({ role: 'assistant', content: stripThinking(content) });
@@ -358,26 +456,48 @@ class LocalCodingAgentViewProvider implements vscode.WebviewViewProvider {
         signal: AbortSignal;
         messages: ChatMessage[];
         tools?: unknown[];
+        recovery?: boolean;
     }): Promise<{ content: string; toolCalls: OllamaToolCall[] }> {
 
         const cfg = settings();
+        const wantThinking = cfg.thinking && !req.recovery;
 
-        const response = await fetch(`${cfg.ollamaUrl}/api/chat`, {
+        const send = (includeThink: boolean) => fetch(`${cfg.ollamaUrl}/api/chat`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             signal: req.signal,
             body: JSON.stringify({
                 model: req.model,
                 keep_alive: cfg.keepAlive,
-                messages: req.messages,
+                messages: req.messages.map(({ role, content, tool_calls, tool_name }) => ({ role, content, tool_calls, tool_name })),
                 tools: req.tools,
                 stream: true,
-                // Ollama's default context window is small; agent runs need room
-                // for the system prompt, tool schemas and file contents.
-                options: { num_ctx: cfg.contextLength }
+                // Thinking models (qwen3, deepseek-r1) reason silently before
+                // answering, which can take a long time. It is off by default;
+                // when on, the reasoning streams into a collapsible panel.
+                ...(includeThink ? { think: wantThinking } : {}),
+                options: {
+                    // Ollama's default context window is small; agent runs need room
+                    // for the system prompt, tool schemas and file contents.
+                    num_ctx: cfg.contextLength,
+                    num_predict: MAX_OUTPUT_TOKENS,
+                    ...(req.recovery ? RECOVERY_OPTIONS : ANTI_REPEAT_OPTIONS)
+                }
             })
         });
 
+        let response = await send(!this.noThinkSupport.has(req.model));
+
+        if (!response.ok) {
+            const detail = await response.text().catch(() => '');
+            // Models without thinking support may reject the "think" flag.
+            if (response.status === 400 && /think/i.test(detail) && !this.noThinkSupport.has(req.model)) {
+                this.noThinkSupport.add(req.model);
+                response = await send(false);
+            } else {
+                throw new Error(`Ollama returned HTTP ${response.status}: ${detail || response.statusText}`);
+            }
+        }
         if (!response.ok) {
             const detail = await response.text().catch(() => '');
             throw new Error(`Ollama returned HTTP ${response.status}: ${detail || response.statusText}`);
@@ -391,6 +511,7 @@ class LocalCodingAgentViewProvider implements vscode.WebviewViewProvider {
         let buffer = '';
         let content = '';
         const toolCalls: OllamaToolCall[] = [];
+        let stats: ChatStats | undefined;
 
         this.post({ type: 'startResponse' });
 
@@ -403,12 +524,18 @@ class LocalCodingAgentViewProvider implements vscode.WebviewViewProvider {
                 if (data.error) {
                     throw new Error(String(data.error));
                 }
+                if (data.message?.thinking) {
+                    this.post({ type: 'thinking', text: data.message.thinking });
+                }
                 if (data.message?.content) {
                     content += data.message.content;
                     this.post({ type: 'token', text: data.message.content });
                 }
                 if (Array.isArray(data.message?.tool_calls)) {
                     toolCalls.push(...data.message.tool_calls);
+                }
+                if (data.done) {
+                    stats = readStats(data);
                 }
             } catch (error) {
                 if (error instanceof SyntaxError) {
@@ -431,7 +558,14 @@ class LocalCodingAgentViewProvider implements vscode.WebviewViewProvider {
         }
         handleLine(buffer);
 
-        this.post({ type: 'endResponse' });
+        this.post({ type: 'endResponse', stats });
+        if (stats && stats.promptTokens >= cfg.contextLength * 0.9) {
+            this.post({
+                type: 'notice',
+                ok: false,
+                text: `The conversation is close to the ${cfg.contextLength}-token context window. Start a new chat or raise "Context Length" in settings for better answers.`
+            });
+        }
         return { content, toolCalls };
     }
 
@@ -615,6 +749,22 @@ If a tool returns an error, read it, fix your arguments and retry.
 
 function stripThinking(content: string): string {
     return content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+}
+
+function isRepetitionError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /repeat limit|repetition|repeated/i.test(message);
+}
+
+function readStats(data: any): ChatStats {
+    const evalSeconds = (data.eval_duration ?? 0) / 1e9;
+    const outputTokens = data.eval_count ?? 0;
+    return {
+        promptTokens: data.prompt_eval_count ?? 0,
+        outputTokens,
+        tokensPerSecond: evalSeconds > 0 ? outputTokens / evalSeconds : 0,
+        totalSeconds: (data.total_duration ?? 0) / 1e9
+    };
 }
 
 function abortError(): Error {
